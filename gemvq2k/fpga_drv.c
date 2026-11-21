@@ -3,21 +3,44 @@
 #include <linux/fs.h>
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
+#include <linux/platform_device.h>
+#include <linux/device.h>
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/jiffies.h>
 #include "gemv_q2k_uapi.h"
+
 #define GEMV_Q2K_BASE 0xA0000000UL /* CHANGE: AXI-Lite base */
 #define GEMV_Q2K_SPAN 0x1000
 #define GEMV_Q2K_TILE_BYTES (4U * 1024U * 1024U) /* CHANGE to available CMA */
+
 #define R32(x) readl(regs + (x))
 #define W32(v,x) writel((v), regs + (x))
+
 enum { CTRL=0, W0=0x10,Y0=0x20,O0=0x30,W1=0x40,Y1=0x50,O1=0x60,NB=0x70,R0=0x80,R1=0x90,STATUS=0xa0 };
-static void __iomem *regs; static DEFINE_MUTEX(lock); static int major;
-struct buf { void *cpu; dma_addr_t dma; }; static struct buf bw0,by0,bo0,bw1,by1,bo1;
-static int allocb(struct buf *b){ b->cpu=dma_alloc_coherent(NULL,GEMV_Q2K_TILE_BYTES,&b->dma,GFP_KERNEL); return b->cpu?0:-ENOMEM; }
-static void freeb(struct buf *b){if(b->cpu)dma_free_coherent(NULL,GEMV_Q2K_TILE_BYTES,b->cpu,b->dma);}
+
+static void __iomem *regs;
+static DEFINE_MUTEX(lock);
+static int major;
+static struct platform_device *pdev;
+static struct class *dev_cls;
+static struct device *dev_node;
+
+struct buf { void *cpu; dma_addr_t dma; };
+static struct buf bw0,by0,bo0,bw1,by1,bo1;
+
+static int allocb(struct buf *b){
+    b->cpu = dma_alloc_coherent(&pdev->dev, GEMV_Q2K_TILE_BYTES, &b->dma, GFP_KERNEL);
+    return b->cpu ? 0 : -ENOMEM;
+}
+static void freeb(struct buf *b){
+    if (b->cpu && pdev) {
+        dma_free_coherent(&pdev->dev, GEMV_Q2K_TILE_BYTES, b->cpu, b->dma);
+        b->cpu = NULL;
+    }
+}
 static void ptr(unsigned r,dma_addr_t a){W32(lower_32_bits(a),r);W32(upper_32_bits(a),r+4);}
+
 static long submit(struct gemv_q2k_job __user *u) {
  struct gemv_q2k_job j; size_t wb,yb,ob; unsigned long end; int rc=0;
  if(copy_from_user(&j,u,sizeof(j))) return -EFAULT;
@@ -35,8 +58,45 @@ static long submit(struct gemv_q2k_job __user *u) {
  if(copy_to_user((void __user *)(unsigned long)j.output,bo0.cpu,j.rows0*4)||copy_to_user((void __user *)(unsigned long)(j.output+j.rows0*4),bo1.cpu,j.rows1*4))rc=-EFAULT;
 out: mutex_unlock(&lock); if(!rc&&copy_to_user(u,&j,sizeof(j)))rc=-EFAULT; return rc;
 }
+
 static long ioctl_(struct file *f,unsigned c,unsigned long a){return c==GEMV_Q2K_SUBMIT?submit((void __user *)a):-ENOTTY;}
 static const struct file_operations fops={.owner=THIS_MODULE,.unlocked_ioctl=ioctl_};
-static int __init init_(void){int r;if((r=allocb(&bw0))||(r=allocb(&by0))||(r=allocb(&bo0))||(r=allocb(&bw1))||(r=allocb(&by1))||(r=allocb(&bo1)))return r;regs=ioremap(GEMV_Q2K_BASE,GEMV_Q2K_SPAN);if(!regs)return -ENOMEM;major=register_chrdev(0,"gemv_q2k",&fops);return major<0?major:0;}
-static void __exit exit_(void){if(major>0)unregister_chrdev(major,"gemv_q2k");if(regs)iounmap(regs);freeb(&bw0);freeb(&by0);freeb(&bo0);freeb(&bw1);freeb(&by1);freeb(&bo1);}
+
+static void cleanup_all(void){
+    if (dev_node && !IS_ERR(dev_node)) device_destroy(dev_cls, MKDEV(major, 0));
+    if (dev_cls && !IS_ERR(dev_cls)) class_destroy(dev_cls);
+    if (major > 0) unregister_chrdev(major, "gemv_q2k");
+    if (regs) iounmap(regs);
+    freeb(&bw0); freeb(&by0); freeb(&bo0); freeb(&bw1); freeb(&by1); freeb(&bo1);
+    if (pdev && !IS_ERR(pdev)) platform_device_unregister(pdev);
+}
+
+static int __init init_(void){
+    int r;
+    pdev = platform_device_register_simple("gemv_q2k", -1, NULL, 0);
+    if (IS_ERR(pdev)) return PTR_ERR(pdev);
+
+    r = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+    if (r) { platform_device_unregister(pdev); return r; }
+
+    if ((r=allocb(&bw0))||(r=allocb(&by0))||(r=allocb(&bo0))||(r=allocb(&bw1))||(r=allocb(&by1))||(r=allocb(&bo1))){
+        cleanup_all();
+        return r;
+    }
+    regs = ioremap(GEMV_Q2K_BASE, GEMV_Q2K_SPAN);
+    if (!regs) { cleanup_all(); return -ENOMEM; }
+
+    major = register_chrdev(0, "gemv_q2k", &fops);
+    if (major < 0) { cleanup_all(); return major; }
+
+    dev_cls = class_create(THIS_MODULE, "gemv_q2k");
+    if (IS_ERR(dev_cls)) { r = PTR_ERR(dev_cls); cleanup_all(); return r; }
+
+    dev_node = device_create(dev_cls, NULL, MKDEV(major, 0), NULL, "gemv_q2k");
+    if (IS_ERR(dev_node)) { r = PTR_ERR(dev_node); cleanup_all(); return r; }
+
+    return 0;
+}
+
+static void __exit exit_(void){ cleanup_all(); }
 module_init(init_);module_exit(exit_);MODULE_LICENSE("GPL");
